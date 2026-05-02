@@ -1,17 +1,24 @@
-name: NoseyParker - GitHub Repo Scanner
+name: TruffleHog - Org Secret Scanner
 
 on:
   workflow_dispatch:
     inputs:
-      target_repo:
-        description: 'GitHub repo to scan (owner/repo format)'
+      target_org:
+        description: 'GitHub Organization to scan (e.g., google)'
         required: true
         type: string
-      is_private:
-        description: 'Is this a private repo?'
+      scan_type:
+        description: 'Scan type'
+        required: true
+        default: 'org'
+        type: choice
+        options:
+          - org
+          - repo
+      target_repo:
+        description: 'Repo to scan (owner/repo) - only if scan_type=repo'
         required: false
-        default: false
-        type: boolean
+        type: string
 
 jobs:
   scan:
@@ -21,80 +28,83 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 1. تثبيت NoseyParker (Docker - أسرع)
-      - name: Pull NoseyParker
-        run: docker pull ghcr.io/praetorian-inc/noseyparker:latest
-
-      # 2. استنساخ الـ Repo
-      - name: Clone Repository
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}  # للـ private repos
+      # 1. تثبيت TruffleHog
+      - name: Install TruffleHog
         run: |
-          REPO="${{ github.event.inputs.target_repo }}"
-          
-          if [ "${{ github.event.inputs.is_private }}" == "true" ]; then
-            git clone --depth 1 https://x-access-token:${GH_PAT}@github.com/${REPO}.git target-repo
-          else
-            git clone --depth 1 https://github.com/${REPO}.git target-repo
-          fi
+          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin
+          trufflehog --version
 
-      # 3. تشغيل الفحص
-      - name: Run Scan
+      # 2. تشغيل الفحص
+      - name: Run TruffleHog Scan
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}  # Required for org scan
         run: |
           mkdir -p results
           
-          docker run --rm \
-            -v $(pwd)/target-repo:/scan:ro \
-            -v $(pwd)/results:/results \
-            ghcr.io/praetorian-inc/noseyparker:latest \
-            scan --datastore /results/np.db /scan
+          if [ "${{ github.event.inputs.scan_type }}" == "org" ]; then
+            # فحص الـ Organization كاملة - verified only
+            trufflehog github --org ${{ github.event.inputs.target_org }} \
+              --results=verified \
+              --json > results/trufflehog-report.json 2>&1 || true
+          else
+            # فحص repo معين
+            trufflehog github --repo ${{ github.event.inputs.target_repo }} \
+              --results=verified \
+              --json > results/trufflehog-report.json 2>&1 || true
+          fi
 
-      # 4. توليد التقرير
-      - name: Generate Report
+      # 3. تنسيق التقرير للبشر
+      - name: Format Report
         run: |
-          docker run --rm \
-            -v $(pwd)/results:/results \
-            ghcr.io/praetorian-inc/noseyparker:latest \
-            report --datastore /results/np.db --format json > results/report.json
+          # عدد النتائج
+          COUNT=$(cat results/trufflehog-report.json | jq -s 'length')
+          echo "Total findings: $COUNT" > results/summary.txt
           
-          docker run --rm \
-            -v $(pwd)/results:/results \
-            ghcr.io/praetorian-inc/noseyparker:latest \
-            report --datastore /results/np.db --format human > results/report.txt
+          # تنسيق human-readable
+          cat results/trufflehog-report.json | jq -r '
+            . as $item |
+            "═══════════════════════════════════════\n" +
+            "🔴 DETECTOR: \($item.DetectorName // "Unknown")\n" +
+            "📁 FILE: \($item.SourceMetadata.Data.Github.file // "N/A")\n" +
+            "🔗 REPO: \($item.SourceMetadata.Data.Github.repository // "N/A")\n" +
+            "🔑 VERIFIED: \($item.Verified // false)\n" +
+            "📅 COMMIT: \($item.SourceMetadata.Data.Github.commit // "N/A")\n" +
+            "═══════════════════════════════════════\n"
+          ' > results/report.txt 2>/dev/null || echo "No verified secrets found." > results/report.txt
 
-      # 5. إرسال لـ Discord
+      # 4. إرسال لـ Discord
       - name: Send to Discord
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
-          REPO="${{ github.event.inputs.target_repo }}"
-          COUNT=$(cat results/report.json | jq '[.[] | length] | add // 0')
+          COUNT=$(cat results/trufflehog-report.json | jq -s 'length')
+          TARGET="${{ github.event.inputs.target_org }}"
           
           # إرسال ملخص
           curl -H "Content-Type: application/json" \
             -d "{
-              \"username\": \"🔍 NoseyParker\",
+              \"username\": \"🐷 TruffleHog Bot\",
               \"embeds\": [{
-                \"title\": \"Secret Scan Results\",
-                \"description\": \"**Repo:** \`${REPO}\`\n**Findings:** \`${COUNT}\` potential secrets\",
+                \"title\": \"🔍 TruffleHog Scan Complete\",
+                \"description\": \"**Target:** \`${TARGET}\`\n**Type:** \`${{ github.event.inputs.scan_type }}\`\n**Verified Secrets:** \`${COUNT}\`\",
                 \"color\": $(if [ "$COUNT" -gt 0 ]; then echo 15158332; else echo 3066993; fi),
-                \"fields\": [
-                  {\"name\": \"Type\", \"value\": \"$(if [ '${{ github.event.inputs.is_private }}' == 'true' ]; then echo '🔒 Private'; else echo '🌐 Public'; fi)\", \"inline\": true}
-                ],
-                \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
+                \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",
+                \"footer\": {\"text\": \"TruffleHog Scanner\"}
               }]
             }" \
             $DISCORD_WEBHOOK
 
-          # إرسال التقرير الكامل
-          curl -F "file1=@results/report.txt" \
-            -F "payload_json={\"content\":\"📄 Detailed report for \`${REPO}\`\"}" \
-            $DISCORD_WEBHOOK
+          # إرسال التقرير (لو فيه نتائج)
+          if [ "$COUNT" -gt 0 ]; then
+            curl -F "file1=@results/report.txt" \
+              -F "payload_json={\"content\":\"📄 Verified secrets found in \`${TARGET}\`\"}" \
+              $DISCORD_WEBHOOK
+          fi
 
-      # 6. رفع الـ Artifact
+      # 5. رفع الـ Artifact
       - name: Upload Results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: scan-results-${{ github.event.inputs.target_repo }}
+          name: trufflehog-results-${{ github.event.inputs.target_org }}
           path: results/
