@@ -1,0 +1,108 @@
+name: NoseyParker Secret Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: 'GitHub repo URL to scan (e.g., https://github.com/user/repo)'
+        required: true
+        type: string
+      target_branch:
+        description: 'Branch to scan'
+        required: false
+        default: 'main'
+        type: string
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    
+    steps:
+      # 1. Checkout الـ workflow repo
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      # 2. تثبيت NoseyParker
+      - name: Install NoseyParker
+        run: |
+          # تثبيت المتطلبات
+          sudo apt-get update && sudo apt-get install -y cmake make gcc g++ git
+      
+          # تثبيت Rust
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          source $HOME/.cargo/env
+      
+          # بناء NoseyParker
+          git clone https://github.com/praetorian-inc/noseyparker.git
+          cd noseyparker
+          cargo build --release
+      
+          # نقل البيناري لمكان عام
+          sudo cp target/release/noseyparker /usr/local/bin/
+          cd ..
+          noseyparker --version
+
+      # 3. استنساخ الـ Target Repo
+      - name: Clone target repository
+        run: |
+          git clone --branch ${{ github.event.inputs.target_branch }} \
+            --single-branch \
+            ${{ github.event.inputs.target_repo }} \
+            target-repo
+
+      # 4. تشغيل NoseyParker Scan
+      - name: Run NoseyParker Scan
+        run: |
+          mkdir -p results
+          noseyparker scan --datastore results/np.db ./target-repo
+
+      # 5. إنشاء تقرير JSON
+      - name: Generate Report
+        run: |
+          noseyparker report --datastore results/np.db --format json > results/noseyparker-report.json
+          noseyparker report --datastore results/np.db --format human > results/noseyparker-report.txt
+
+      # 6. إرسال النتائج لـ Discord
+      - name: Send Results to Discord
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          # عدد الأسرار المكتشفة
+          FINDINGS_COUNT=$(noseyparker report --datastore results/np.db --format json | jq '.[] | length' | awk '{s+=$1} END {print s}')
+          if [ -z "$FINDINGS_COUNT" ] || [ "$FINDINGS_COUNT" = "0" ]; then
+            FINDINGS_COUNT=0
+          fi
+          
+          # إعداد الرسالة
+          REPO_NAME=$(echo "${{ github.event.inputs.target_repo }}" | sed 's/.*github.com\///')
+          
+          # إرسال رسالة ملخصة
+          curl -H "Content-Type: application/json" \
+            -d "{
+              \"username\": \"NoseyParker Bot\",
+              \"avatar_url\": \"https://i.imgur.com/4M34hi2.png\",
+              \"embeds\": [{
+                \"title\": \"🔍 Secret Scan Complete\",
+                \"description\": \"**Target:** \`${REPO_NAME}\`\n**Branch:** \`${{ github.event.inputs.target_branch }}\`\n**Findings:** \`${FINDINGS_COUNT}\` secrets detected\",
+                \"color\": $(if [ \"$FINDINGS_COUNT\" -gt 0 ]; then echo 15158332; else echo 3066993; fi),
+                \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",
+                \"footer\": {
+                  \"text\": \"NoseyParker Scanner\"
+                }
+              }]
+            }" \
+            $DISCORD_WEBHOOK
+
+          # إرسال ملف التقرير
+          curl -F "file1=@results/noseyparker-report.txt" \
+            -F "payload_json={\"content\":\"📄 Full scan report attached.\"}" \
+            $DISCORD_WEBHOOK
+
+      # 7. رفع النتائج كـ Artifact (اختياري)
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: noseyparker-results
+          path: results/
+          retention-days: 7
