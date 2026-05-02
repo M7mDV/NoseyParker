@@ -4,19 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       target_org:
-        description: 'GitHub Organization to scan'
+        description: 'GitHub Organization to scan (exact name, case-sensitive)'
         required: true
         type: string
-      tools:
-        description: 'Tools to run'
-        required: true
-        default: 'all'
-        type: choice
-        options:
-          - all
-          - trufflehog-only
-          - gitleaks-only
-          - noseyparker-only
 
 jobs:
   scan:
@@ -28,40 +18,40 @@ jobs:
         uses: actions/checkout@v4
 
       # ═══════════════════════════════════════
-      # 1. تثبيت كل الأدوات
+      # 1. تثبيت الأدوات
       # ═══════════════════════════════════════
       - name: Install Tools
         run: |
           mkdir -p results/org results/reports
           
-          # ─── TruffleHog ───
+          # TruffleHog
           curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin
           trufflehog --version
           
-          # ─── Gitleaks ───
+          # Gitleaks
           wget -q https://github.com/gitleaks/gitleaks/releases/latest/download/gitleaks_$(curl -s https://api.github.com/repos/gitleaks/gitleaks/releases/latest | grep tag_name | cut -d'"' -f4 | sed 's/v//')_linux_x64.tar.gz -O gitleaks.tar.gz
           tar -xzf gitleaks.tar.gz && sudo mv gitleaks /usr/local/bin/
           gitleaks version
           
-          # ─── NoseyParker (Docker) ───
+          # NoseyParker (Docker)
           docker pull ghcr.io/praetorian-inc/noseyparker:latest
           
-          # ─── GitHub CLI ───
+          # GitHub CLI
           type -p gh >/dev/null || (curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null && sudo apt update && sudo apt install gh -y)
           gh --version
 
       # ═══════════════════════════════════════
-      # 2. TruffleHog (GitHub Source)
+      # 2. TruffleHog (GitHub Source) - مع quotes
       # ═══════════════════════════════════════
       - name: 🔴 TruffleHog Scan
-        if: github.event.inputs.tools == 'all' || github.event.inputs.tools == 'trufflehog-only'
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          echo "🐷 Running TruffleHog on org: ${{ github.event.inputs.target_org }}"
+          ORG="${{ github.event.inputs.target_org }}"
+          echo "🐷 Running TruffleHog on org: $ORG"
           
           trufflehog github \
-            --org ${{ github.event.inputs.target_org }} \
+            --org="$ORG" \
             --results=verified \
             --include-wikis \
             --issue-comments \
@@ -69,170 +59,146 @@ jobs:
             --gist-comments \
             --json > results/trufflehog.json 2> results/trufflehog.log || true
           
-          # تنسيق النتائج
           if [ ! -s results/trufflehog.json ]; then echo "[]" > results/trufflehog.json; fi
           COUNT=$(cat results/trufflehog.json | jq -s 'length')
           echo "TRUFFLEHOG_COUNT=$COUNT" >> $GITHUB_ENV
-          
-          # تقرير human-readable
-          cat results/trufflehog.json | jq -r '
-            select(. != null) |
-            "═══════════════════════════════════════\n" +
-            "🔴 TRUFFLEHOG FINDING\n" +
-            "DETECTOR: \(.DetectorName // "Unknown")\n" +
-            "REPO: \(.SourceMetadata.Data.Github.repository // "N/A")\n" +
-            "FILE: \(.SourceMetadata.Data.Github.file // "N/A")\n" +
-            "COMMIT: \(.SourceMetadata.Data.Github.commit // "N/A")\n" +
-            "VERIFIED: \(.Verified // false)\n" +
-            "LINK: \(.SourceMetadata.Data.Github.link // "N/A")\n" +
-            "═══════════════════════════════════════\n"
-          ' > results/reports/trufflehog-report.txt 2>/dev/null || echo "No verified secrets found." > results/reports/trufflehog-report.txt
+          echo "TruffleHog found: $COUNT secrets"
 
       # ═══════════════════════════════════════
-      # 3. Gitleaks (Clone + Scan)
+      # 3. Gitleaks - مع quotes صحيحة
       # ═══════════════════════════════════════
       - name: 🟡 Gitleaks Scan
-        if: github.event.inputs.tools == 'all' || github.event.inputs.tools == 'gitleaks-only'
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          echo "🔍 Running Gitleaks on all repos in: ${{ github.event.inputs.target_org }}"
+          ORG="${{ github.event.inputs.target_org }}"
+          echo "🔍 Running Gitleaks on all repos in: $ORG"
           
-          # جلب قائمة الـ repos
-          gh repo list ${{ github.event.inputs.target_org }} \
+          # جلب الـ repos بـ quotes
+          gh repo list "$ORG" \
             --limit 1000 \
-            --json nameWithOwner,url \
-            | jq -r '.[].url' > results/repo-list.txt
+            --json nameWithOwner,url > results/repos.json
           
-          TOTAL_REPOS=$(wc -l < results/repo-list.txt)
+          TOTAL_REPOS=$(cat results/repos.json | jq 'length')
           echo "Found $TOTAL_REPOS repos"
           
+          if [ "$TOTAL_REPOS" -eq 0 ]; then
+            echo "No repos found! Check org name and token permissions."
+            echo "[]" > results/gitleaks.json
+            echo "GITLEAKS_COUNT=0" >> $GITHUB_ENV
+            exit 0
+          fi
+          
           # فحص كل repo
-          > results/gitleaks.json
-          while read -r repo_url; do
+          > results/gitleaks-raw.jsonl
+          cat results/repos.json | jq -r '.[].url' | while read -r repo_url; do
             repo_name=$(basename "$repo_url")
             tmp=$(mktemp -d)
             
             echo "Cloning: $repo_name"
             if git clone --depth 1 "$repo_url" "$tmp" 2>/dev/null; then
-              gitleaks detect --source "$tmp" --report-format json --report-path "$tmp/leaks.json" -v || true
+              gitleaks detect --source="$tmp" --report-format=json --report-path="$tmp/leaks.json" -v || true
               
-              # إضافة اسم الـ repo للـ JSON
               if [ -f "$tmp/leaks.json" ] && [ -s "$tmp/leaks.json" ]; then
-                cat "$tmp/leaks.json" | jq --arg repo "$repo_name" '.[] + {repo: $repo}' >> results/gitleaks.json
+                cat "$tmp/leaks.json" | jq --arg repo "$repo_name" --arg url "$repo_url" '.[] + {repo: $repo, url: $url}' >> results/gitleaks-raw.jsonl
               fi
+            else
+              echo "Failed to clone: $repo_name"
             fi
             
             rm -rf "$tmp"
-          done < results/repo-list.txt
+          done
           
-          # عدد النتائج
-          if [ ! -s results/gitleaks.json ]; then echo "[]" > results/gitleaks.json; fi
-          COUNT=$(cat results/gitleaks.json | jq -s 'length')
+          # تحويل لـ JSON array
+          if [ -s results/gitleaks-raw.jsonl ]; then
+            cat results/gitleaks-raw.jsonl | jq -s '.' > results/gitleaks.json
+          else
+            echo "[]" > results/gitleaks.json
+          fi
+          
+          COUNT=$(cat results/gitleaks.json | jq 'length')
           echo "GITLEAKS_COUNT=$COUNT" >> $GITHUB_ENV
-          
-          # تقرير
-          cat results/gitleaks.json | jq -r '
-            select(. != null) |
-            "═══════════════════════════════════════\n" +
-            "🟡 GITLEAKS FINDING\n" +
-            "REPO: \(.repo // "Unknown")\n" +
-            "FILE: \(.File // "N/A")\n" +
-            "RULE: \(.RuleID // "N/A")\n" +
-            "COMMIT: \(.Commit // "N/A")\n" +
-            "START LINE: \(.StartLine // "N/A")\n" +
-            "═══════════════════════════════════════\n"
-          ' > results/reports/gitleaks-report.txt 2>/dev/null || echo "No secrets found." > results/reports/gitleaks-report.txt
+          echo "Gitleaks found: $COUNT secrets"
 
       # ═══════════════════════════════════════
-      # 4. NoseyParker (Mono Checkout)
+      # 4. NoseyParker - Mono Checkout
       # ═══════════════════════════════════════
       - name: 🔵 NoseyParker Scan
-        if: github.event.inputs.tools == 'all' || github.event.inputs.tools == 'noseyparker-only'
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
+          ORG="${{ github.event.inputs.target_org }}"
           echo "📦 Running NoseyParker on mono checkout"
           
-          # Clone كل الـ repos تحت ./org
+          # Clone كل الـ repos
           mkdir -p org
-          gh repo list ${{ github.event.inputs.target_org }} \
-            --limit 1000 \
-            --json nameWithOwner,url \
-            | jq -r '.[].url' | while read -r repo_url; do
-              repo_name=$(basename "$repo_url")
-              git clone --depth 1 "$repo_url" "org/$repo_name" 2>/dev/null || true
-            done
+          cat results/repos.json | jq -r '.[].url' | while read -r repo_url; do
+            repo_name=$(basename "$repo_url")
+            git clone --depth 1 "$repo_url" "org/$repo_name" 2>/dev/null || echo "Skip: $repo_name"
+          done
+          
+          SCAN_SIZE=$(du -sh org/ 2>/dev/null | cut -f1)
+          REPO_COUNT=$(ls -1 org/ 2>/dev/null | wc -l)
+          echo "Cloned $REPO_COUNT repos ($SCAN_SIZE)"
+          
+          if [ "$REPO_COUNT" -eq 0 ]; then
+            echo "No repos cloned!"
+            echo "NOSEYPARKER_COUNT=0" >> $GITHUB_ENV
+            exit 0
+          fi
           
           # فحص بـ NoseyParker
           docker run --rm \
-            -v $(pwd)/org:/scan:ro \
-            -v $(pwd)/results:/results \
+            -v "$(pwd)/org:/scan:ro" \
+            -v "$(pwd)/results:/results" \
             ghcr.io/praetorian-inc/noseyparker:latest \
-            scan --datastore /results/np.db /scan
+            scan --datastore=/results/np.db /scan
           
-          # توليد التقرير
+          # توليد التقارير
           docker run --rm \
-            -v $(pwd)/results:/results \
+            -v "$(pwd)/results:/results" \
             ghcr.io/praetorian-inc/noseyparker:latest \
-            report --datastore /results/np.db --format json > results/noseyparker.json
+            report --datastore=/results/np.db --format=json > results/noseyparker.json
           
-          docker run --rm \
-            -v $(pwd)/results:/results \
-            ghcr.io/praetorian-inc/noseyparker:latest \
-            report --datastore /results/np.db --format human > results/reports/noseyparker-report.txt
-          
-          # عدد النتائج
-          COUNT=$(cat results/noseyparker.json | jq -s '[.[] | length] | add // 0')
+          COUNT=$(cat results/noseyparker.json | jq -length 2>/dev/null || echo 0)
           echo "NOSEYPARKER_COUNT=$COUNT" >> $GITHUB_ENV
+          echo "NoseyParker found: $COUNT secrets"
 
       # ═══════════════════════════════════════
-      # 5. إرسال النتائج لـ Discord
+      # 5. إرسال لـ Discord
       # ═══════════════════════════════════════
       - name: 📤 Send to Discord
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
           ORG="${{ github.event.inputs.target_org }}"
-          
-          # جلب الـ counts
           TH=${TRUFFLEHOG_COUNT:-0}
           GL=${GITLEAKS_COUNT:-0}
           NP=${NOSEYPARKER_COUNT:-0}
           TOTAL=$((TH + GL + NP))
           
-          # إرسال ملخص
+          echo "Summary: TruffleHog=$TH, Gitleaks=$GL, NoseyParker=$NP"
+          
           curl -H "Content-Type: application/json" \
             -d "{
               \"username\": \"🔍 Secret Scanner\",
               \"embeds\": [{
-                \"title\": \"🎯 Org Scan Complete: ${ORG}\",
-                \"description\": \"**Total Findings:** \`${TOTAL}\`\n\n🔴 TruffleHog (verified): \`${TH}\`\n🟡 Gitleaks: \`${GL}\`\n🔵 NoseyParker: \`${NP}\`\",
+                \"title\": \"🎯 Scan Complete: $ORG\",
+                \"description\": \"**Total Findings:** \\`${TOTAL}\\`\n\n🔴 TruffleHog (verified): \\`${TH}\\`\n🟡 Gitleaks: \\`${GL}\\`\n🔵 NoseyParker: \\`${NP}\\`\",
                 \"color\": $(if [ "$TOTAL" -gt 0 ]; then echo 15158332; else echo 3066993; fi),
                 \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",
                 \"footer\": {\"text\": \"Multi-Tool Scanner\"}
               }]
             }" \
             $DISCORD_WEBHOOK
-          
-          # إرسال كل التقارير
-          for report in results/reports/*.txt; do
-            if [ -f "$report" ]; then
-              curl -F "file1=@$report" \
-                -F "payload_json={\"content\":\"📄 $(basename $report)\"}" \
-                $DISCORD_WEBHOOK
-            fi
-          done
 
       # ═══════════════════════════════════════
-      # 6. رفع الـ Artifacts
+      # 6. رفع النتائج
       # ═══════════════════════════════════════
       - name: 📦 Upload Results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: secret-scan-${{ github.event.inputs.target_org }}-${{ github.run_id }}
-          path: |
-            results/
-            org/
+          name: scan-${{ github.event.inputs.target_org }}-${{ github.run_id }}
+          path: results/
           retention-days: 7
