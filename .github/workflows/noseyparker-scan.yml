@@ -7,18 +7,6 @@ on:
         description: 'GitHub Organization to scan (e.g., google)'
         required: true
         type: string
-      scan_type:
-        description: 'Scan type'
-        required: true
-        default: 'org'
-        type: choice
-        options:
-          - org
-          - repo
-      target_repo:
-        description: 'Repo to scan (owner/repo) - only if scan_type=repo'
-        required: false
-        type: string
 
 jobs:
   scan:
@@ -34,50 +22,58 @@ jobs:
           curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin
           trufflehog --version
 
-      # 2. تشغيل الفحص
+      # 2. تشغيل الفحص + حفظ النتائج
       - name: Run TruffleHog Scan
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT }}  # Required for org scan
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           mkdir -p results
           
-          if [ "${{ github.event.inputs.scan_type }}" == "org" ]; then
-            # فحص الـ Organization كاملة - verified only
-            trufflehog github --org ${{ github.event.inputs.target_org }} \
-              --results=verified \
-              --json > results/trufflehog-report.json 2>&1 || true
-          else
-            # فحص repo معين
-            trufflehog github --repo ${{ github.event.inputs.target_repo }} \
-              --results=verified \
-              --json > results/trufflehog-report.json 2>&1 || true
+          # تشغيل الفحص وحفظ الـ JSON
+          trufflehog github --org ${{ github.event.inputs.target_org }} \
+            --results=verified \
+            --json > results/trufflehog.json 2> results/trufflehog-stderr.log || true
+          
+          # لو الملف فاضي، اعمله [] فاضي
+          if [ ! -s results/trufflehog.json ]; then
+            echo "[]" > results/trufflehog.json
           fi
+          
+          # طباعة للـ debug
+          echo "=== STDERR ==="
+          cat results/trufflehog-stderr.log || true
+          echo "=== JSON Size ==="
+          wc -c results/trufflehog.json
 
-      # 3. تنسيق التقرير للبشر
+      # 3. تنسيق التقرير
       - name: Format Report
         run: |
-          # عدد النتائج
-          COUNT=$(cat results/trufflehog-report.json | jq -s 'length')
-          echo "Total findings: $COUNT" > results/summary.txt
+          # عدد النتائج (كل سطر = JSON object)
+          COUNT=$(cat results/trufflehog.json | jq -s 'length')
+          echo "Total verified secrets: $COUNT" | tee results/summary.txt
           
           # تنسيق human-readable
-          cat results/trufflehog-report.json | jq -r '
-            . as $item |
-            "═══════════════════════════════════════\n" +
-            "🔴 DETECTOR: \($item.DetectorName // "Unknown")\n" +
-            "📁 FILE: \($item.SourceMetadata.Data.Github.file // "N/A")\n" +
-            "🔗 REPO: \($item.SourceMetadata.Data.Github.repository // "N/A")\n" +
-            "🔑 VERIFIED: \($item.Verified // false)\n" +
-            "📅 COMMIT: \($item.SourceMetadata.Data.Github.commit // "N/A")\n" +
-            "═══════════════════════════════════════\n"
-          ' > results/report.txt 2>/dev/null || echo "No verified secrets found." > results/report.txt
+          if [ "$COUNT" -gt 0 ]; then
+            cat results/trufflehog.json | jq -r '
+              select(. != null) |
+              "═══════════════════════════════════════\n" +
+              "🔴 DETECTOR: \(.DetectorName // "Unknown")\n" +
+              "📁 FILE: \(.SourceMetadata.Data.Github.file // "N/A")\n" +
+              "🔗 REPO: \(.SourceMetadata.Data.Github.repository // "N/A")\n" +
+              "🔑 VERIFIED: \(.Verified // false)\n" +
+              "📅 COMMIT: \(.SourceMetadata.Data.Github.commit // "N/A")\n" +
+              "═══════════════════════════════════════\n"
+            ' > results/report.txt
+          else
+            echo "✅ No verified secrets found in ${{ github.event.inputs.target_org }}" > results/report.txt
+          fi
 
       # 4. إرسال لـ Discord
       - name: Send to Discord
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
-          COUNT=$(cat results/trufflehog-report.json | jq -s 'length')
+          COUNT=$(cat results/trufflehog.json | jq -s 'length')
           TARGET="${{ github.event.inputs.target_org }}"
           
           # إرسال ملخص
@@ -86,7 +82,7 @@ jobs:
               \"username\": \"🐷 TruffleHog Bot\",
               \"embeds\": [{
                 \"title\": \"🔍 TruffleHog Scan Complete\",
-                \"description\": \"**Target:** \`${TARGET}\`\n**Type:** \`${{ github.event.inputs.scan_type }}\`\n**Verified Secrets:** \`${COUNT}\`\",
+                \"description\": \"**Org:** \`${TARGET}\`\n**Verified Secrets:** \`${COUNT}\`\",
                 \"color\": $(if [ "$COUNT" -gt 0 ]; then echo 15158332; else echo 3066993; fi),
                 \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",
                 \"footer\": {\"text\": \"TruffleHog Scanner\"}
@@ -94,12 +90,10 @@ jobs:
             }" \
             $DISCORD_WEBHOOK
 
-          # إرسال التقرير (لو فيه نتائج)
-          if [ "$COUNT" -gt 0 ]; then
-            curl -F "file1=@results/report.txt" \
-              -F "payload_json={\"content\":\"📄 Verified secrets found in \`${TARGET}\`\"}" \
-              $DISCORD_WEBHOOK
-          fi
+          # إرسال التقرير
+          curl -F "file1=@results/report.txt" \
+            -F "payload_json={\"content\":\"📄 Scan report for \`${TARGET}\`\"}" \
+            $DISCORD_WEBHOOK
 
       # 5. رفع الـ Artifact
       - name: Upload Results
