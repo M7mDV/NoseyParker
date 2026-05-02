@@ -1,35 +1,45 @@
-name: NoseyParker Secret Scan
+name: NoseyParker - GitHub Repo Scanner
 
 on:
   workflow_dispatch:
     inputs:
       target_repo:
-        description: 'GitHub repo URL to scan'
+        description: 'GitHub repo to scan (owner/repo format)'
         required: true
         type: string
-      target_branch:
-        description: 'Branch to scan'
+      is_private:
+        description: 'Is this a private repo?'
         required: false
-        default: 'main'
-        type: string
+        default: false
+        type: boolean
 
 jobs:
   scan:
     runs-on: ubuntu-latest
     
     steps:
-      # 1. Checkout workflow repo
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2. استنساخ الـ Target Repo
-      - name: Clone target repository
-        run: |
-          git clone --depth 1 --branch ${{ github.event.inputs.target_branch }} \
-            ${{ github.event.inputs.target_repo }} target-repo
+      # 1. تثبيت NoseyParker (Docker - أسرع)
+      - name: Pull NoseyParker
+        run: docker pull ghcr.io/praetorian-inc/noseyparker:latest
 
-      # 3. تشغيل NoseyParker عبر Docker
-      - name: Run NoseyParker Scan
+      # 2. استنساخ الـ Repo
+      - name: Clone Repository
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}  # للـ private repos
+        run: |
+          REPO="${{ github.event.inputs.target_repo }}"
+          
+          if [ "${{ github.event.inputs.is_private }}" == "true" ]; then
+            git clone --depth 1 https://x-access-token:${GH_PAT}@github.com/${REPO}.git target-repo
+          else
+            git clone --depth 1 https://github.com/${REPO}.git target-repo
+          fi
+
+      # 3. تشغيل الفحص
+      - name: Run Scan
         run: |
           mkdir -p results
           
@@ -39,8 +49,8 @@ jobs:
             ghcr.io/praetorian-inc/noseyparker:latest \
             scan --datastore /results/np.db /scan
 
-      # 4. توليد التقارير
-      - name: Generate Reports
+      # 4. توليد التقرير
+      - name: Generate Report
         run: |
           docker run --rm \
             -v $(pwd)/results:/results \
@@ -57,27 +67,28 @@ jobs:
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
-          REPO_NAME=$(echo "${{ github.event.inputs.target_repo }}" | sed 's/.*github.com\///')
-          
-          # عدد النتائج
+          REPO="${{ github.event.inputs.target_repo }}"
           COUNT=$(cat results/report.json | jq '[.[] | length] | add // 0')
           
           # إرسال ملخص
           curl -H "Content-Type: application/json" \
             -d "{
-              \"username\": \"NoseyParker Bot\",
+              \"username\": \"🔍 NoseyParker\",
               \"embeds\": [{
-                \"title\": \"🔍 Secret Scan Complete\",
-                \"description\": \"**Target:** \`${REPO_NAME}\`\n**Branch:** \`${{ github.event.inputs.target_branch }}\`\n**Findings:** \`${COUNT}\` secrets detected\",
+                \"title\": \"Secret Scan Results\",
+                \"description\": \"**Repo:** \`${REPO}\`\n**Findings:** \`${COUNT}\` potential secrets\",
                 \"color\": $(if [ "$COUNT" -gt 0 ]; then echo 15158332; else echo 3066993; fi),
+                \"fields\": [
+                  {\"name\": \"Type\", \"value\": \"$(if [ '${{ github.event.inputs.is_private }}' == 'true' ]; then echo '🔒 Private'; else echo '🌐 Public'; fi)\", \"inline\": true}
+                ],
                 \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
               }]
             }" \
             $DISCORD_WEBHOOK
 
-          # إرسال ملف التقرير
+          # إرسال التقرير الكامل
           curl -F "file1=@results/report.txt" \
-            -F "payload_json={\"content\":\"📄 Full report attached\"}" \
+            -F "payload_json={\"content\":\"📄 Detailed report for \`${REPO}\`\"}" \
             $DISCORD_WEBHOOK
 
       # 6. رفع الـ Artifact
@@ -85,5 +96,5 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: noseyparker-results
+          name: scan-results-${{ github.event.inputs.target_repo }}
           path: results/
