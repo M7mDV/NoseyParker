@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       target_org:
-        description: 'GitHub Organization to scan (exact name, case-sensitive)'
+        description: 'GitHub Organization to scan (exact login name, no spaces)'
         required: true
         type: string
 
@@ -41,7 +41,7 @@ jobs:
           gh --version
 
       # ═══════════════════════════════════════
-      # 2. TruffleHog (GitHub Source) - مع quotes
+      # 2. TruffleHog (GitHub Source)
       # ═══════════════════════════════════════
       - name: 🔴 TruffleHog Scan
         env:
@@ -65,7 +65,7 @@ jobs:
           echo "TruffleHog found: $COUNT secrets"
 
       # ═══════════════════════════════════════
-      # 3. Gitleaks - مع quotes صحيحة
+      # 3. Gitleaks - مع GH_TOKEN صحيح
       # ═══════════════════════════════════════
       - name: 🟡 Gitleaks Scan
         env:
@@ -74,7 +74,10 @@ jobs:
           ORG="${{ github.event.inputs.target_org }}"
           echo "🔍 Running Gitleaks on all repos in: $ORG"
           
-          # جلب الـ repos بـ quotes
+          # تسجيل الدخول بـ gh
+          echo "${{ secrets.GH_PAT }}" | gh auth login --with-token
+          
+          # جلب الـ repos
           gh repo list "$ORG" \
             --limit 1000 \
             --json nameWithOwner,url > results/repos.json
@@ -130,9 +133,12 @@ jobs:
           ORG="${{ github.event.inputs.target_org }}"
           echo "📦 Running NoseyParker on mono checkout"
           
+          # تسجيل الدخول بـ gh
+          echo "${{ secrets.GH_PAT }}" | gh auth login --with-token
+          
           # Clone كل الـ repos
           mkdir -p org
-          cat results/repos.json | jq -r '.[].url' | while read -r repo_url; do
+          gh repo list "$ORG" --limit 1000 --json nameWithOwner,url | jq -r '.[].url' | while read -r repo_url; do
             repo_name=$(basename "$repo_url")
             git clone --depth 1 "$repo_url" "org/$repo_name" 2>/dev/null || echo "Skip: $repo_name"
           done
